@@ -1,0 +1,12 @@
+- 2026-03-12
+Planner
+↓
+ToolExecutor
+↓
+ObservationHandler
+↓
+Finalizer
+↓
+Critic
+↓
+Answer
