@@ -1,32 +1,3 @@
-# rag_agent_mongo_doubao.py
-# ============================================================
-# 文章/稿件问答智能体（RAG Agent for Articles）
-# - MongoDB 7.0 $vectorSearch + Python rerank fallback
-# - Lesson10: Policy-controlled retrieval loop
-# - Lesson11: Critic reviewer + fix strategies
-#
-# Requirements:
-#   pip install pymongo numpy torch volcenginesdk-ark-runtime
-#
-# Env:
-#   export ARK_API_KEY="xxx"
-#   export MONGO_URI="mongodb://localhost:27017"
-#   export MONGO_DB="rag"
-#   export MONGO_COL="article_chunks"
-#   export DEFAULT_VISIBILITY="internal"
-#
-# Optional:
-#   export EMBED_MODEL="doubao-embedding-vision-250615"
-#   export JUDGE_MODEL="doubao-pro-32k"
-#   export POLICY_MODEL="doubao-pro-32k"
-#   export VECTOR_INDEX_NAME="vec_index"
-#
-# Run:
-#   python rag_agent_mongo_doubao.py --seed_demo --project "财经"
-#   python rag_agent_mongo_doubao.py --ask "这篇稿件主要讲了什么？" --policy --critic
-#   python rag_agent_mongo_doubao.py --ask "稿件里提到的风险点有哪些？" --policy --critic --article_id "A20260201_001"
-# ============================================================
-
 import os
 import re
 import json
@@ -835,6 +806,7 @@ class RetrievalPolicy:
         """
         evidence_text = self._trim(evidence_text)
 
+        # todo 更加宽松一点
         system = (
             "你是一个 RAG 检索控制器（Retrieval Controller）。\n"
             "你的任务是判断：当前检索到的 evidence 是否足以回答用户问题。\n\n"
@@ -1217,6 +1189,148 @@ def handle_observation(
     }
 
 
+# def compress_evidence(
+#         question: str,
+#         evidences: List[Evidence],
+#         pre_evidence_max_chars: int = 100
+# ) -> List[Evidence]:
+#     """
+#     把证据压缩成更短的关键事实版本
+#     返回新的 Evidence 列表(保留 id/source,替换 text)
+#     :param question:
+#     :param evidences:
+#     :param pre_evidence_max_chars:
+#     :return:
+#     """
+#     if not evidences:
+#         return []
+#
+#     compressed: List[Evidence] = []
+#
+#     system = (
+#         "你是一个证据压缩器 (Evidence Compression)。\n"
+#         "你的任务是根据问题，从 evidence 中提炼出最关键、最有助于回答问题的事实。\n"
+#         "要求：\n"
+#         "- 只保留与回答问题直接相关的信息\n"
+#         "- 不要补充原文没有的信息\n"
+#         "- 尽量压缩，保留事实、时间、数字、主体、结论\n"
+#         "- 如果 evidence 与问题关系很弱，可以输出原文的一句短摘录\n"
+#         "- 只输出 JSON，不要额外文字\n"
+#         '输出格式：{"compressed_text":"..."}\n'
+#     )
+#
+#     for e in evidences:
+#         user = json.dumps(
+#             {
+#                 "question": question,
+#                 "evidence": {
+#                     "id": e.id,
+#                     "text": e.text[:1200]
+#                 }
+#             }
+#         )
+#
+#         out = call_llm_json(
+#             system=system,
+#             user=user,
+#             max_tokens=200,
+#             temperature=0.0,
+#         )
+#
+#         compressed_text = ""
+#         if isinstance(out, dict):
+#             compressed_text = str(out.get("compressed_text", "")).strip()
+#
+#         if not compressed_text:
+#             compressed_text = e.text[:pre_evidence_max_chars]
+#
+#         compressed_text = compressed_text[:pre_evidence_max_chars]
+#
+#         compressed.append(
+#             Evidence(
+#                 id=e.id,
+#                 source=e.source,
+#                 text=compressed_text,
+#                 score=e.score,
+#                 source_id=e.source_id,
+#                 article_id=e.article_id,
+#                 title=getattr(e, "title", None),
+#                 publish_at=e.publish_at,
+#                 section_path=e.section_path
+#             )
+#         )
+#     return compressed
+
+def llm_rerank_evidence(
+        question: str,
+        evidences: List[Evidence],
+        final_n: int = FINAL_N
+) -> List[Evidence]:
+    """
+    排序器
+    把最相关的顶上来
+    :return: 排序后的FINAL_N条数据
+    """
+
+    if not evidences:
+        return []
+
+    RERANK_MAX_INPUT = 15
+
+    evidences = evidences[:RERANK_MAX_INPUT]
+
+    # 证据压缩(evidence compression)
+    ev_pack = [
+        {"id": e.id, "text": e.text[:400]}
+        for e in evidences
+    ]
+
+    system = (
+        "你是一个检索结果排序器（Reranker）。\n"
+        "根据问题，判断哪些 evidence 最有助于回答问题。\n"
+        "优先选择包含答案关键事实的 evidence。\n"
+        "只返回按相关性从高到低排序后的 evidence id 列表。\n"
+        "必须输出 JSON，不要任何额外文字。\n"
+        "输出格式：\n"
+        "{\n"
+        '  "ranked_ids": ["H3", "H1", "H2"]\n'
+        "}\n"
+        "规则：\n"
+        "- ranked_ids 必须包含输入 evidence 的所有 id\n"
+        "- 不要编造新的 id\n"
+        "- 按最有助于回答问题的顺序排序\n"
+    )
+
+    user = json.dumps({
+        "question": question,
+        "evidence": ev_pack
+    }, ensure_ascii=False)
+
+    out = call_llm_json(system=system, user=user, max_tokens=300, temperature=0.0)
+
+    ranked_ids = out.get("ranked_ids", []) if isinstance(out, dict) else []
+
+    if not isinstance(ranked_ids, list):
+        ranked_ids = []
+
+    if not ranked_ids:
+        return evidences[:final_n]
+
+    id_map = {e.id: e for e in evidences}
+    ranked: List[Evidence] = []
+    for rid in ranked_ids:
+        rid = str(rid).strip()
+        if rid in id_map and id_map[rid] not in ranked:
+            ranked.append(id_map[rid])
+
+    # 兜底
+    for e in evidences:
+        if e not in ranked:
+            ranked.append(e)
+
+    return ranked[:final_n]
+
+
 def finalize_answer(
         question: str,
         final_evidence: List[Evidence],
@@ -1370,6 +1484,12 @@ def qa_agent_with_policy(
             article_id=article_id,
             state=state,
         )
+        if evidences and len(evidences) > FINAL_N:
+            evidences = llm_rerank_evidence(
+                question=question,
+                evidences=evidences,
+                final_n=FINAL_N
+            )
         last_evidence = evidences
 
         # 更新去重状态

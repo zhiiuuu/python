@@ -1,7 +1,30 @@
 - 2026-03-12
+RAG Pipeline
+Query
+↓
+Rewrite
+↓
+Retrieve
+↓
+Hybrid Retrieve
+↓
+RRF
+↓
+Candidate Evidence
+↓
+LLM Rerank
+↓
+Policy Decision
+↓
+Answer
+↓
+Critic
+
+
+- 2026-03-11
 Planner
 ↓
-ToolExecutor
+ToolExecutor (hybrid retrieval)
 ↓
 ObservationHandler
 ↓

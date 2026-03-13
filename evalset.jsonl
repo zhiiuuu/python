@@ -1,0 +1,8 @@
+{"id":"q001","question":"稿件中提到AI基础设施投资面临哪些风险？","gold_keywords":["电力","GPU","供应链","资本开支"],"must_answer":true}
+{"id":"q002","question":"稿件中提到为什么云厂商会加大AI基础设施投资？","gold_keywords":["推理需求","企业私有化部署"],"must_answer":true}
+{"id":"q003","question":"企业落地RAG系统通常包括哪些步骤？","gold_keywords":["数据切分","向量召回","提示词","审稿"],"must_answer":true}
+{"id":"q004","question":"RAG系统为什么需要审稿机制？","gold_keywords":["引用","幻觉"],"must_answer":true}
+{"id":"q005","question":"AI数据中心建设面临哪些挑战？","gold_keywords":["电力","GPU","资本开支"],"must_answer":true}
+{"id":"q006","question":"稿件中是否提到消费电子市场情况？","gold_keywords":["消费电子"],"must_answer":true}
+{"id":"q007","question":"AI基础设施投资加速的原因是什么？","gold_keywords":["推理需求","私有化部署"],"must_answer":true}
+{"id":"q008","question":"稿件里提到的数据中心扩建带来了哪些问题？","gold_keywords":["电力","供应链","资本开支"],"must_answer":true}
