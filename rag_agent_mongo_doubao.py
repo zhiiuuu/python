@@ -255,6 +255,253 @@ def _build_filter(
     return f
 
 
+def rerank_evidences_llm(
+        query: str,
+        evidences: List[Dict[str, Any]],
+        top_k: int = 5,
+        max_text_len: int = 300,
+) -> List[Dict[str, Any]]:
+    """
+    使用 LLM 对 merge 后的 evidences 做 rerank
+    输入 evidence 至少包含:
+    {
+        "source_id":str,
+        "text":str,
+        "scores":List[float],
+        "queries_hit":List[str]
+    }
+    返回按 rerank 后顺序排序的 top_k evidences
+    """
+    query = query.strip()
+    if not query:
+        return []
+
+    if not evidences:
+        return []
+
+    if top_k <= 0:
+        return []
+
+    if len(evidences) <= top_k:
+        return evidences
+
+    candidates = []
+    # 预处理 evidence, 生成给 LLM 的候选文本
+    for ev in evidences:
+        if not isinstance(ev, dict):
+            continue
+
+        source_id = ev.get("source_id")
+        text = ev.get("text", "")[:max_text_len]
+        scores = ev.get("scores", [])
+        queries_hit = ev.get("queries_hit", [])
+
+        if not source_id or not isinstance(text, str):
+            continue
+
+        text = text.strip()
+        if not text:
+            continue
+
+        if not isinstance(scores, list):
+            scores = []
+        if not isinstance(queries_hit, list):
+            queries_hit = []
+
+        max_score = max(scores) if scores else 0
+        hit_count = len(set(queries_hit))
+        short_text = text[:max_text_len]
+
+        candidates.append({
+            "source_id": source_id,
+            "text": short_text,
+            "max_score": max_score,
+            "hit_count": hit_count
+        })
+
+    if not candidates:
+        return []
+
+    if len(candidates) <= top_k:
+        source_id_set = {c["source_id"] for c in candidates}
+        return [ev for ev in evidences if ev.get("source_id") in source_id_set]
+
+    # 2.构造给 LLM 的输入文本
+    candidates_lines = []
+    for idx, c in enumerate(candidates, start=1):
+        block = (
+            f"[{idx}]\n"
+            f"source_id: {c['source_id']}\n"
+            f"max_score: {c['max_score']}\n"
+            f"hit_count: {c['hit_count']}\n"
+            f"text: {c['text']}\n"
+        )
+        candidates_lines.append(block)
+
+    return None
+
+def multi_query_hybrid_retrieve(
+        queries: List[str],
+        top_k_query: int = 5,
+        final_top_k: int = 8
+) -> List[Dict[str, Any]]:
+    """
+    对多个 query 分别做 hybrid retrieve
+    再按 source_id 合并,最后排序并截断
+    """
+    if not queries:
+        return []
+
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    for query in queries:
+        if not isinstance(query, str):
+            continue
+
+        query = query.strip()
+        if not query:
+            continue
+
+        try:
+            evidences = hybrid_retrieve(query, top_k=top_k_query)
+        except Exception:
+            continue
+
+        if not evidences:
+            continue
+
+        for ev in evidences:
+            if not isinstance(ev, dict):
+                continue
+
+            source_id = ev.get("source_id")
+            text = ev.get("text", "")
+            score = ev.get("score", 0)
+
+            if source_id not in merged:
+                merged[source_id] = {
+                    "source_id": source_id,
+                    "scores": [score],
+                    "text": text,
+                    "queries_hit": [query]
+                }
+            else:
+                # 确保每一个 query 只命中一次
+                # queries_hit去重是为了保证"命中次数"这个信号是真的,而不是重复计算
+                if query not in merged[source_id]["queries_hit"]:
+                    merged[source_id]["queries_hit"].append(query)
+                merged[source_id]["scores"].append(score)
+
+    merged_list = list(merged.values())
+
+    merged_list.sort(
+        key=lambda x: (
+            max(x["scores"]) if x["scores"] else 0,
+            len(x["queries_hit"])
+        ),
+        reverse=True
+    )
+    return merged_list[:final_top_k]
+
+
+def to_bool(x: Any):
+    if x is True:
+        return True
+
+    if isinstance(x, str):
+        v = x.strip().lower()
+
+        if v in ("true", "1"):
+            return True
+
+    if isinstance(x, (int, float)):
+        return x != 0
+
+    return False
+
+
+def filter_expanded_queries_llm(
+        current_query: str,
+        queries: List[str]
+) -> List[str]:
+    """
+    过滤扩展query
+    只保留与原问题意图一致的 query
+    """
+    if not isinstance(current_query, str):
+        return []
+
+    current_query = current_query.strip()
+    if not current_query:
+        return []
+
+    if not queries:
+        return []
+
+    system = (
+        "你是一个检索query过滤器。"
+        "任务："
+        "判断候选query是否保持与原问题相同的问题意图。"
+        "规则："
+        "- 保留与原问题意图一致的query"
+        "- 如果query改变了问题方向，则判为false"
+        "- 如果query只是同义表达、关键词补充或更具体的检索表达，则判为true"
+        "- 只输出JSON，不包含任何解释或额外字段"
+        '输出格式：{"keep":[true,false]}'
+    )
+
+    user = json.dumps({
+        "current_query": current_query,
+        "queries": queries
+    }, ensure_ascii=False)
+
+    try:
+        out = call_llm_json(system=system, user=user)
+    except Exception:
+        return []
+
+    keep = out.get("keep", [])
+    if not isinstance(keep, list):
+        return []
+
+    valid_queries = [
+        q for q, k in zip(queries, keep) if to_bool(k)
+    ]
+    return valid_queries
+
+
+def expand_queries_llm(
+        question: str,
+        max_queries: int = 2
+) -> List[str]:
+    """
+    query expansion
+    """
+    system = (
+        "你是一个检索查询扩展器。"
+        f"根据 current_query，生成 max_queries 个语义一致、更适合文档检索的query。"
+        "要求："
+        "- 不改变原问题含义"
+        "- 不改变原问题意图"
+        "- 只做同义表达、关键词补充或更具体的检索表达"
+        "- 不要发散到无关主题"
+        "- 只输出 JSON"
+        "输出格式："
+        "{"
+        '"queries":[]'
+        "}"
+    )
+    user = json.dumps({
+        "current_query": question,
+        "max_queries": max_queries
+    })
+    out = call_llm_json(system=system, user=user)
+    queries = out.get("queries", [])
+    if not isinstance(queries, list):
+        return []
+    return [query.strip() for query in queries if query.strip()][:max_queries]
+
+
 def hybrid_retrieve(
         query: str,
         top_k: int = CANDIDATE_K,
@@ -806,7 +1053,10 @@ class RetrievalPolicy:
         """
         evidence_text = self._trim(evidence_text)
 
-        # todo 更加宽松一点
+        # "- 若缺少关键要素（时间、主体、范围、结论、影响）→ 不足\n"
+        # 太过于严格 使用宽松规则
+        # "- 若 evidence 已包含问答问题的核心要点（即使细节不完整），可判定为 SUFFICIENT\n"
+        # "- 不需要覆盖所有细节，只要能够回答主要问题即可\n"
         system = (
             "你是一个 RAG 检索控制器（Retrieval Controller）。\n"
             "你的任务是判断：当前检索到的 evidence 是否足以回答用户问题。\n\n"
@@ -818,7 +1068,9 @@ class RetrievalPolicy:
             "RATIONALE: <一句简短原因>\n"
             "REWRITE_QUERY: <仅当 decision 为 REWRITE_QUERY 时给出>\n\n"
             "判断规则：\n"
-            "- 若缺少关键要素（时间、主体、范围、结论、影响）→ 不足\n"
+            # "- 若缺少关键要素（时间、主体、范围、结论、影响）→ 不足\n"
+            "- 若 evidence 已包含问答问题的核心要点（即使细节不完整），可判定为 SUFFICIENT\n"
+            "- 不需要覆盖所有细节，只要能够回答主要问题即可\n"
             "- 若 evidence 部分相关但信息不完整 → RETRIEVE_MORE\n"
             "- 若 query 与 evidence 明显不匹配或过于宽泛 → REWRITE_QUERY\n"
             "- 若 evidence 已足以支持回答 → SUFFICIENT\n"
@@ -1473,23 +1725,31 @@ def qa_agent_with_policy(
         # 1) planner
         tool_call = plan_tool_step(current_query, state)
 
-        # 2) executor
-        evidences = execute_tool_step(
-            executor,
-            tool_call,
-            project_keyword=project_keyword,
-            date_from=date_from,
-            date_to=date_to,
-            exclude_source_ids=exclude_source_ids,
-            article_id=article_id,
-            state=state,
-        )
-        if evidences and len(evidences) > FINAL_N:
-            evidences = llm_rerank_evidence(
-                question=question,
-                evidences=evidences,
-                final_n=FINAL_N
+        # query expansion
+        expanded = expand_queries_llm(current_query)
+        queries = [current_query] + expanded
+
+        # 可能会产生 query drift(查询漂移) 所以要判断相关性
+
+        for q in queries:
+            # 2) executor
+            evidences = execute_tool_step(
+                executor,
+                tool_call,
+                project_keyword=project_keyword,
+                date_from=date_from,
+                date_to=date_to,
+                exclude_source_ids=exclude_source_ids,
+                article_id=article_id,
+                state=state,
             )
+            if evidences and len(evidences) > FINAL_N:
+                evidences = llm_rerank_evidence(
+                    question=q,
+                    evidences=evidences,
+                    final_n=FINAL_N
+                )
+
         last_evidence = evidences
 
         # 更新去重状态

@@ -1,3 +1,12 @@
+- 2026-03-17
+current_query
+→ expand
+→ filter
+→ deduplicate
+→ multi_query_hybrid_retrieve
+→ merge by source_id
+→ sort + truncate
+
 - 2026-03-12
 RAG Pipeline
 Query
