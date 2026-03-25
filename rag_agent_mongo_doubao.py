@@ -324,7 +324,11 @@ def rerank_evidences_llm(
 
     if len(candidates) <= top_k:
         source_id_set = {c["source_id"] for c in candidates}
-        return [ev for ev in evidences if ev.get("source_id") in source_id_set]
+        return [
+                   ev
+                   for ev in evidences
+                   if isinstance(ev, dict) and ev.get("source_id") in source_id_set
+               ][:top_k]
 
     # 2.构造给 LLM 的输入文本
     candidates_lines = []
@@ -338,12 +342,122 @@ def rerank_evidences_llm(
         )
         candidates_lines.append(block)
 
-    return None
+    candidate_text = "\n".join(candidates_lines)
+
+    system = (
+        "你是一个检索证据重排器。"
+        "任务：根据原问题，从候选证据中选出最相关、最能直接支持回答的证据。"
+        "规则："
+        "- 优先选择与原问题语义最相关、最能直接支持回答的证据"
+        "- 可以参考 max_score 和 hit_count，但最终以语义相关性和回答支持度为准"
+        "- 只返回最相关的 top_k 个 source_id"
+        "- 只输出 JSON，不包含任何解释或额外的字段"
+        '输出格式：{"top_source_ids":["s1","s2"]}'
+    )
+
+    user = (
+        f"原问题：\n{query}\n\n"
+        f"top_k：{top_k}\n\n"
+        f"候选证据：\n{candidate_text}"
+    )
+    try:
+        out = call_llm_json(system=system, user=user)
+    except Exception:
+        return evidences[:top_k]
+
+    top_source_ids = out.get("top_source_ids", [])
+    if not isinstance(top_source_ids, list):
+        return evidences[:top_k]
+
+    # 容错后处理: 过滤非法id+去重+补齐未返回的
+    valid_source_ids = [c["source_id"] for c in candidates]
+    valid_source_ids_set = set(valid_source_ids)
+
+    reranked_ids: List[str] = []
+    seen = set()
+
+    # 先保留 LLM 返回的合法 source_id 顺序
+    for sid in top_source_ids:
+        if not isinstance(sid, str):
+            continue
+        sid = sid.strip()
+        if not sid:
+            continue
+        if sid not in valid_source_ids_set:
+            continue
+        if sid in seen:
+            continue
+
+        reranked_ids.append(sid)
+        seen.add(sid)
+
+    for sid in valid_source_ids:
+        if sid not in seen:
+            reranked_ids.append(sid)
+            seen.add(sid)
+
+    # 再把未返回的候选原顺序补齐
+    reranked_ids = reranked_ids[:top_k]
+
+    # 按reranked_ids回填原始 evidence
+    evidence_map: Dict[str, Dict[str, Any]] = {}
+    for ev in evidences:
+        if not isinstance(ev, dict):
+            continue
+        sid = ev.get("source_id")
+        if not isinstance(sid,str) or not sid.strip():
+            continue
+        evidence_map[sid.strip()] = ev
+
+    reranked_evidences = [
+        evidence_map[sid]
+        for sid in reranked_ids
+        if sid in evidence_map
+    ]
+
+    return reranked_evidences
+
+
+def merged_dict_to_evidence_List(
+        items: List[Dict[str, Any]]
+) -> List[Evidence]:
+    results: List[Evidence] = []
+
+    for i, item in enumerate(items, start=1):
+        source_id = str(item.get("source_id", "") or "").strip()
+        text = str(item.get("text", "") or "").strip()
+        scores = item.get("scores", []) or []
+
+        if not source_id or not text:
+            continue
+
+        score = max(scores) if scores else 0.0
+
+        results.append(
+            Evidence(
+                id=f"M{i}",
+                source=source_id,
+                text=text,
+                score=float(score),
+                source_id=source_id,
+                article_id="",
+                title="",
+                publish_at="",
+                section_path=""
+            )
+        )
+    return results
+
 
 def multi_query_hybrid_retrieve(
         queries: List[str],
         top_k_query: int = 5,
-        final_top_k: int = 8
+        final_top_k: int = 8,
+        project_keyword: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        exclude_source_ids: Optional[Set[str]] = None,
+        article_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     对多个 query 分别做 hybrid retrieve
@@ -363,7 +477,15 @@ def multi_query_hybrid_retrieve(
             continue
 
         try:
-            evidences = hybrid_retrieve(query, top_k=top_k_query)
+            evidences = hybrid_retrieve(
+                query=query,
+                top_k=top_k_query,
+                project_keyword=project_keyword,
+                date_from=date_from,
+                date_to=date_to,
+                exclude_source_ids=exclude_source_ids,
+                article_id=article_id
+            )
         except Exception:
             continue
 
@@ -371,12 +493,12 @@ def multi_query_hybrid_retrieve(
             continue
 
         for ev in evidences:
-            if not isinstance(ev, dict):
+            if not isinstance(ev, Evidence):
                 continue
 
-            source_id = ev.get("source_id")
-            text = ev.get("text", "")
-            score = ev.get("score", 0)
+            source_id = ev.source_id
+            text = ev.text
+            score = ev.score
 
             if source_id not in merged:
                 merged[source_id] = {
@@ -500,6 +622,124 @@ def expand_queries_llm(
     if not isinstance(queries, list):
         return []
     return [query.strip() for query in queries if query.strip()][:max_queries]
+
+
+def deduplicate_queries(
+        queries: List[str]
+) -> List[str]:
+    """
+    按轻量归一化的结果去重,但保留原始 query 文本
+
+    使用正则去除标点符号 并且小写
+    """
+    seen = set()
+    results: List[str] = []
+
+    for q in queries:
+        if not isinstance(q, str):
+            continue
+
+        raw = q.strip()
+        if not raw:
+            continue
+
+        norm = normalize_query_for_dedup(raw)
+        if not norm:
+            continue
+
+        if norm not in seen:
+            seen.add(norm)
+            results.append(raw)
+
+    return results
+
+
+def normalize_query_for_dedup(
+        query: str
+) -> str:
+    if not isinstance(query, str):
+        return ""
+
+    q = query.strip().lower()
+    q = re.sub(r"[，。！？、；：‘’“”（）《》【】〈〉,.!?;:()\"'`\[\]{}<>/\\\-_=+@#$%^&*~|]+", "", q)
+    return q
+
+
+def build_multi_queries(
+        current_query: str,
+        max_expand_queries: int = 2
+) -> List[str]:
+    if not isinstance(current_query, str):
+        return []
+
+    current_query = current_query.strip()
+    if not current_query:
+        return []
+
+    expand_queries = expand_queries_llm(
+        question=current_query,
+        max_queries=max_expand_queries
+    )
+
+    valid_queries = filter_expanded_queries_llm(
+        current_query=current_query,
+        queries=expand_queries
+    )
+
+    all_queries = [current_query] + valid_queries
+    all_queries = deduplicate_queries(all_queries)
+
+    return all_queries
+
+
+def retrieve_with_expanded_queries(
+        current_query: str,
+        *,
+        project_keyword: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        article_id: Optional[str] = None,
+        max_expanded_queries: int = 2,
+        top_k_per_query: int = 5,
+        final_top_k: int = 8,
+        rerank_top_k: int = 5
+) -> List[Evidence]:
+    """
+    current_query
+    -> expand query
+    -> filter queries / dedup
+    -> hybrid retrieve
+    -> rerank
+    -> 转成 Evidence 列表
+    """
+    all_queries = build_multi_queries(
+        current_query=current_query,
+        max_expand_queries=max_expanded_queries
+    )
+
+    if not all_queries:
+        return []
+
+    merged_items = multi_query_hybrid_retrieve(
+        queries=all_queries,
+        top_k_query=top_k_per_query,
+        final_top_k=final_top_k,
+        project_keyword=project_keyword,
+        date_from=date_from,
+        date_to=date_to,
+        article_id=article_id,
+    )
+
+    if not merged_items:
+        return []
+
+    reranked_items = rerank_evidences_llm(
+        query=current_query,
+        evidences=merged_items,
+        top_k=rerank_top_k
+    )
+
+    return merged_dict_to_evidence_List(reranked_items)
 
 
 def hybrid_retrieve(
@@ -1713,8 +1953,6 @@ def qa_agent_with_policy(
         enable_critic: bool = True,
 ) -> Dict[str, Any]:
     state = AgentState(top_k=TOPK_INIT)
-    executor = ToolExecutor(TOOLS)
-
     current_query = question
     exclude_source_ids: Set[str] = set()
     last_evidence: List[Evidence] = []
@@ -1725,30 +1963,22 @@ def qa_agent_with_policy(
         # 1) planner
         tool_call = plan_tool_step(current_query, state)
 
-        # query expansion
-        expanded = expand_queries_llm(current_query)
-        queries = [current_query] + expanded
+        if tool_call["tool"] == "no_tool":
+            evidences = []
+        else:
+            planned_query = str(tool_call["args"].get("query", "") or current_query).strip() or current_query
 
-        # 可能会产生 query drift(查询漂移) 所以要判断相关性
-
-        for q in queries:
-            # 2) executor
-            evidences = execute_tool_step(
-                executor,
-                tool_call,
+            evidences = retrieve_with_expanded_queries(
+                current_query=planned_query,
                 project_keyword=project_keyword,
                 date_from=date_from,
                 date_to=date_to,
-                exclude_source_ids=exclude_source_ids,
+                max_expanded_queries=2,
+                top_k_per_query=state.top_k,
+                final_top_k=max(state.top_k, FINAL_N),
+                rerank_top_k=FINAL_N,
                 article_id=article_id,
-                state=state,
             )
-            if evidences and len(evidences) > FINAL_N:
-                evidences = llm_rerank_evidence(
-                    question=q,
-                    evidences=evidences,
-                    final_n=FINAL_N
-                )
 
         last_evidence = evidences
 

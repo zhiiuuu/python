@@ -1,3 +1,8 @@
+- 2026-03-24
+-> expand query filter/deduplicate
+-> multi hybrid retrieve
+-> rerank
+
 - 2026-03-17
 current_query
 → expand
