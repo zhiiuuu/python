@@ -405,7 +405,7 @@ def rerank_evidences_llm(
         if not isinstance(ev, dict):
             continue
         sid = ev.get("source_id")
-        if not isinstance(sid,str) or not sid.strip():
+        if not isinstance(sid, str) or not sid.strip():
             continue
         evidence_map[sid.strip()] = ev
 
@@ -690,6 +690,91 @@ def build_multi_queries(
     all_queries = deduplicate_queries(all_queries)
 
     return all_queries
+
+
+def score_sentence(
+        sentence: str,
+        keywords: List[str]
+) -> float:
+    """
+    打分 长词分数高
+    """
+    score = 0.0
+
+    for kw in keywords:
+        if kw in sentence:
+            score += len(kw)
+
+    return score
+
+
+def extract_query_keywords(
+        question: str
+) -> List[str]:
+    """
+    简单关键词提取(长词优先)
+    """
+    if not isinstance(question, str):
+        return []
+
+    q = question.strip()
+    if not q:
+        return []
+
+    # 去掉常见问句词
+    stop_words = ["什么", "如何", "哪些", "为什么", "请问", "有哪些", "关于"]
+    for w in stop_words:
+        q = q.replace(w, "")
+
+    # 简单切分
+    parts = re.split(r"[的和与及\s]]", q)
+
+    # 过滤 + 去重
+    keywords = []
+    seen = set()
+    for p in parts:
+        p = p.strip()
+        if len(p) < 2:
+            continue
+        if p not in seen:
+            seen.add(p)
+            keywords.append(p)
+
+    # 按长度排序(长词优先)
+    keywords.sort(key=lambda x: len(x), reverse=True)
+    return keywords[:5]
+
+
+def split_sentences(
+        text: str
+) -> List[str]:
+    if not isinstance(text, str):
+        return []
+
+    return [s for s in re.split(r"[。！？]", text) if s.strip()]
+
+
+def compress_evidence_for_policy(
+        question: str,
+        evidences: List[Evidence],
+        max_chars_per_evidence: int = 120
+) -> List[Evidence]:
+    """
+    轻量关键词->句子打分->选高分句
+    """
+    keywords = extract_query_keywords(question)
+
+    for ev in evidences:
+        text = ev.text
+        if not text:
+            continue
+
+        text = split_sentences(text.strip())
+        if not text:
+            continue
+
+    # todo
+    return []
 
 
 def retrieve_with_expanded_queries(
@@ -1293,27 +1378,31 @@ class RetrievalPolicy:
         """
         evidence_text = self._trim(evidence_text)
 
-        # "- 若缺少关键要素（时间、主体、范围、结论、影响）→ 不足\n"
-        # 太过于严格 使用宽松规则
-        # "- 若 evidence 已包含问答问题的核心要点（即使细节不完整），可判定为 SUFFICIENT\n"
-        # "- 不需要覆盖所有细节，只要能够回答主要问题即可\n"
         system = (
-            "你是一个 RAG 检索控制器（Retrieval Controller）。\n"
+            "你是一个 RAG 检索控制器 (Retrieval Controller)。\n"
             "你的任务是判断：当前检索到的 evidence 是否足以回答用户问题。\n\n"
+
             "如果不足，请判断：\n"
             "1）是否继续使用当前 query 扩大检索（RETRIEVE_MORE）\n"
             "2）是否需要改写 query 再检索（REWRITE_QUERY）\n\n"
+
             "严格输出格式：\n"
             "DECISION: <SUFFICIENT|RETRIEVE_MORE|REWRITE_QUERY>\n"
             "RATIONALE: <一句简短原因>\n"
             "REWRITE_QUERY: <仅当 decision 为 REWRITE_QUERY 时给出>\n\n"
+
+            "判断步骤：\n"
+            "1) 判断 evidence 是否与问题相关\n"
+            "2) 判断 evidence 是否已经覆盖回答主问题所需的核心信息\n"
+
             "判断规则：\n"
-            # "- 若缺少关键要素（时间、主体、范围、结论、影响）→ 不足\n"
-            "- 若 evidence 已包含问答问题的核心要点（即使细节不完整），可判定为 SUFFICIENT\n"
-            "- 不需要覆盖所有细节，只要能够回答主要问题即可\n"
-            "- 若 evidence 部分相关但信息不完整 → RETRIEVE_MORE\n"
-            "- 若 query 与 evidence 明显不匹配或过于宽泛 → REWRITE_QUERY\n"
-            "- 若 evidence 已足以支持回答 → SUFFICIENT\n"
+            "- 如果证据不相关或方向错误 → REWRITE_QUERY\n"
+            "- 如果证据相关但信息不足 → RETRIEVE_MORE\n"
+            "- 如果证据已经覆盖核心信息(即使细节不完整) → SUFFICIENT\n"
+
+            "补充规则：\n"
+            "- 如果问题是“有哪些/包括哪些/分类“等列举等问题”必须包含多个要点才算信息充分\n"
+            "- 如果只是单个要点，即使相关，也应判为RETRIEVE_MORE\n"
         )
 
         user = f"""用户问题:
@@ -1373,18 +1462,97 @@ def format_evidence_for_policy(evidence: List[Evidence], max_chunks: int = 6) ->
     return "\n".join(lines)
 
 
-def rewrite_query_llm_by_evidence(question: str, current_query: str, evidence: List[Evidence], turn: int) -> str:
+def extract_rewrite_keywords_from_evidence(
+        snippets: List[str],
+        max_keywords: int = 5,
+        max_phrase_len: int = 18
+) -> List[str]:
+    """
+    从压缩后的高相关 snippets 中抽取 rewrite 用关键词短语(规则版)
+
+    1. 按标点/空白切
+    2. 如果切不出自然短语,就直接用证据短截断当候选
+    3. 过滤太短片段
+    4. 长度优先
+    5. 取前几个给rewrite
+    """
+    if not snippets:
+        return []
+
+    candidates: List[str] = []
+
+    for text in snippets:
+        if not isinstance(text, str):
+            continue
+
+        text = text.strip()
+        if not text:
+            continue
+
+        # 先按标点和空白切
+        parts = re.split(r"[，。！？；：、,\s]+", text)
+        parts = [p.strip() for p in parts if p and p.strip()]
+
+        # 保留长度 ≥3 的候选
+        goods_parts = [p[:max_phrase_len] for p in parts if len(p.strip()) >= 3]
+
+        if goods_parts:
+            candidates.extend(goods_parts)
+        else:
+            short_text = text[:max_phrase_len].strip()
+            if len(short_text) >= 3:
+                candidates.append(short_text)
+
+    # 去重
+    seen = set()
+    deduped: List[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            deduped.append(c)
+
+    # 长度优先
+    deduped.sort(key=lambda x: len(x), reverse=True)
+
+    return deduped[:max_keywords]
+
+
+def rewrite_query_llm_by_evidence(
+        question: str,
+        current_query: str,
+        evidence: List[Evidence],
+        turn: int
+) -> str:
     """
     使用 LLM 改写 query
+    question: 保证不偏题
+    current_query: 知道这轮已经怎么搜过了
+    evidence: 知道当前搜索了什么,缺了什么
     """
     system = (
-        "你是检索查询改写器。根据 question 与已检索 evidence，生成更具体、更可检索的一行 query。"
-        "只输出 query，不要解释。"
-        "要求：包含可检索关键词（主体/事件/时间/地点/指标/结论/争议点等），避免空泛词。"
+        "你是检索查询改写器（Query Rewriter）。\n"
+        "你的任务是基于 question、current_query 和 evidence，生成一个更适合检索的新 query。\n"
+
+        "要求：\n"
+        "- 必须保持与原问题完全相同的意图(严禁改变问题方向)\n"
+        "- 不允许引入与原问题无关的新主题\n"
+        "- 基于 current_query 进行改写\n"
+        "- 优先使用提供的 rewrite_keywords 增强 query\n"
+        "- rewrite_keywords 是从 evidence 中提取的高价值关键词，应重点使用\n"
+        "- 使 query 更具体、更利于命中文档\n"
+        "- 避免空泛表达(如：情况、问题、内容等)\n"
+        "- 只输出一行query，不要任何解释\n"
     )
+    snippets = [ev.text[:180] for ev in evidence[:5] if ev.text]
+    rewrite_keywords = extract_rewrite_keywords_from_evidence(snippets)
     ev_brief = [{"source": e.source, "snippet": e.text[:180]} for e in evidence[:5]]
-    user = json.dumps(
-        {"question": question, "current_query": current_query, "turn": turn, "evidence": ev_brief},
+    user = json.dumps({
+        "question": question,
+        "current_query": current_query,
+        "turn": turn,
+        "evidence": ev_brief,
+        "rewrite_keywords": rewrite_keywords
+    },
         ensure_ascii=False
     )
     resp = ark.chat.completions.create(
@@ -1987,11 +2155,33 @@ def qa_agent_with_policy(
             exclude_source_ids.add(ev.source_id)
             state.seen_source_ids.add(ev.source_id)
 
+        if evidences:
+            policy_evidences = compress_evidence_for_policy(
+                question=question,
+                evidences=[
+                    Evidence(
+                        id=e.id,
+                        source=e.source,
+                        text=e.text,
+                        score=e.score,
+                        source_id=e.source_id,
+                        article_id=e.article_id,
+                        title=e.title,
+                        publish_at=e.publish_at,
+                        section_path=e.section_path,
+                    )
+                    for e in evidences
+                ],
+                max_chars_per_evidence=120
+            )
+        else:
+            policy_evidences = []
+
         # 3) Observation
         obs = handle_observation(
             question=question,
             current_query=current_query,
-            evidences=evidences,
+            evidences=policy_evidences,
             state=state,
             round_id=r,
         )
@@ -2009,7 +2199,7 @@ def qa_agent_with_policy(
         if obs["action"] == "SUFFICIENT":
             return finalize_answer(
                 question=question,
-                final_evidence=obs["evidences"],
+                final_evidence=evidences,  # 使用原始版 而不是压缩版
                 state=state,
                 project_keyword=project_keyword,
                 date_from=date_from,

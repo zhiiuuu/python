@@ -1,3 +1,8 @@
+- 2026-03-27
+-> compress
+-> extract keywords
+-> rewrite query
+
 - 2026-03-24
 -> expand query filter/deduplicate
 -> multi hybrid retrieve
