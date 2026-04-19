@@ -697,7 +697,7 @@ def score_sentence(
         keywords: List[str]
 ) -> float:
     """
-    打分 长词分数高
+    按关键词命中打分 长词分高
     """
     score = 0.0
 
@@ -712,6 +712,7 @@ def extract_query_keywords(
         question: str
 ) -> List[str]:
     """
+    提问题关键词
     简单关键词提取(长词优先)
     """
     if not isinstance(question, str):
@@ -748,6 +749,9 @@ def extract_query_keywords(
 def split_sentences(
         text: str
 ) -> List[str]:
+    """
+    按句子拆分
+    """
     if not isinstance(text, str):
         return []
 
@@ -760,18 +764,30 @@ def compress_evidence_for_policy(
         max_chars_per_evidence: int = 120
 ) -> List[Evidence]:
     """
-    轻量关键词->句子打分->选高分句
+    轻量规则压缩:
+    - 从 question 提取关键词
+    - 对 evidence 按句划分
+    - 句子按关键词命中打分
+    - 取最相关的前 1~2 句
+    - 返回压缩后的 Evidence 列表
     """
+    if not evidences:
+        return []
+
     keywords = extract_query_keywords(question)
+    compressed: List[Evidence] = []
 
     for ev in evidences:
-        text = ev.text
+        text = (ev.text or "").strip()
         if not text:
             continue
 
-        text = split_sentences(text.strip())
-        if not text:
-            continue
+        sentences = split_sentences(text.strip())
+        if not sentences:
+            short_text = text[:max_chars_per_evidence].strip()
+        else:
+            scored_sentences = []
+
 
     # todo
     return []
@@ -836,6 +852,11 @@ def hybrid_retrieve(
         exclude_source_ids: Set[str] = set(),
         article_id: Optional[str] = None,
 ) -> List[Evidence]:
+    """
+    真混合检索:
+    每次都执行 vector retrieve + keyword retrieve
+    再统一做 RRF 融合
+    """
     vector_results = retrieve_topk(
         query=query,
         top_k=top_k,
@@ -845,9 +866,6 @@ def hybrid_retrieve(
         exclude_source_ids=exclude_source_ids,
         article_id=article_id,
     )
-
-    if len(vector_results) >= top_k:
-        return vector_results[:top_k]
 
     keyword_results = keyword_retrieve(
         query=query,
@@ -859,7 +877,63 @@ def hybrid_retrieve(
         article_id=article_id,
     )
 
-    return rrf_fuse(vector_results, keyword_results, top_k=top_k)
+    # 两边都没有
+    if not vector_results and not keyword_results:
+        return []
+
+    # 只有一边有结果时, 也走统一逻辑更稳定
+    fused_results = rrf_fuse(vector_results, keyword_results, top_k=top_k)
+
+    return fused_results
+
+
+def debug_hybrid_retrieve(
+        query: str,
+        top_k: int = 5,
+        project_keyword: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        article_id: Optional[str] = None
+):
+    vector_results = retrieve_topk(
+        query=query,
+        top_k=top_k,
+        project_keyword=project_keyword,
+        date_from=date_from,
+        date_to=date_to,
+        exclude_source_ids=set(),
+        article_id=article_id,
+    )
+
+    keyword_results = keyword_retrieve(
+        query=query,
+        top_k=top_k,
+        project_keyword=project_keyword,
+        date_from=date_from,
+        date_to=date_to,
+        exclude_source_ids=set(),
+        article_id=article_id,
+    )
+
+    fused_results = rrf_fuse(
+        vector_results=vector_results,
+        keyword_results=keyword_results,
+        top_k=top_k,
+    )
+
+    print("\n=============== VECTOR RESULTS ===============")
+    for ev in vector_results:
+        print(f"[{ev.id}] score={ev.score: .4f} source_id={ev.source_id} source={ev.score}")
+
+    print("\n=============== KEYWORD RESULTS ===============")
+    for ev in keyword_results:
+        print(f"[{ev.id}] score={ev.score: .4f} source_id={ev.source_id} source={ev.score}")
+
+    print("\n=============== FUSED RESULTS ===============")
+    for ev in fused_results:
+        print(f"[{ev.id}] score={ev.score: .4f} source_id={ev.source_id} source={ev.score}")
+
+    return fused_results
 
 
 def keyword_retrieve(

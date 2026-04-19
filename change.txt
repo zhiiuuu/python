@@ -1,3 +1,6 @@
+- 2026-04-19
+-> 向量检索然后再keyword+RRF(假混合检索) 改成 每次都同时做 vector + keyword,再统一 RRF 融合(真混合检索)
+
 - 2026-03-27
 -> compress
 -> extract keywords
